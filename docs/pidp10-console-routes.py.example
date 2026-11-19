@@ -1,0 +1,95 @@
+# Worked example: the two (optionally three) routes the Hacker Replicant's
+# chat backend needs, implemented as an add-on to an EXISTING FastAPI web
+# console app that already holds an open line to the machine.
+#
+# This is not a standalone script you run as-is -- there is no bundled
+# boot-API for the PiDP-10 in this repo (unlike some of the sibling Hacker
+# Replicants). The machine this was built against drives its console over a
+# telnet connection to the simulator, with the line's read buffer tracked in
+# an in-memory dict inside the web console's own FastAPI process, rather
+# than via a GNU `screen` session. That telnet/line-buffer state is the
+# reason these routes couldn't be split out into a tiny separate process the
+# way the `screen -X stuff` / `screen -X hardcopy` pattern can for other
+# replicas (see the sibling PiDP-11/PiDP-8i repos for that simpler version,
+# which you can port directly if your own setup uses `screen`).
+#
+# Treat this as a recipe, not a requirement: the two primitives are
+# "read the current screen content" and "type text into the live session" --
+# exactly the same idea as every other Hacker Replicant, just plugged into
+# a telnet-backed console instead of a `screen`-backed one. Adapt the
+# plumbing (LINES, the telnet writer, ANSI-stripping) to whatever your own
+# console app already has lying around; what matters is the shape of the
+# three routes below.
+#
+# Expected pre-existing state in the host app (adapt names freely):
+#   LINES: dict[str, dict]   # one entry per serial/telnet line you expose,
+#                            # each with at least {"buf": bytearray, "writer": StreamWriter|None}
+#   ANSI_RE: a compiled regex that strips ANSI escape sequences
+#   IAC: the telnet "interpret as command" byte (0xFF), for escaping it in outgoing data
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+IAC = 255
+
+
+def _line_or_error(name):
+    """Look up a named line (e.g. 'console' vs 'terminal') and make sure it
+    has a live writer attached. Returns (line_dict, None) on success, or
+    (None, JSONResponse) with an appropriate error to return directly."""
+    if name not in LINES:
+        return None, JSONResponse({"error": "line must be one of: " + ", ".join(LINES)}, status_code=400)
+    if LINES[name]["writer"] is None:
+        return None, JSONResponse(
+            {"error": f"no open connection on line '{name}' -- make sure that session is connected first."},
+            status_code=409,
+        )
+    return LINES[name], None
+
+
+@app.get("/api/pidp10/screen")
+def api_hr_screen(line: str = "terminal"):
+    """Read back the current contents of a line's buffer -- the equivalent
+    of `screen -X hardcopy` for a telnet-backed console. Strips ANSI escapes
+    and returns the tail of the buffer (recent output matters far more to
+    an LLM than the full scrollback)."""
+    d, err = _line_or_error(line)
+    if err:
+        return err
+    raw = ANSI_RE.sub(b"", bytes(d["buf"])).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    text = raw.decode("utf-8", errors="replace")
+    return {"text": text[-4000:]}
+
+
+@app.post("/api/pidp10/keys")
+async def api_hr_keys(request: Request):
+    """Type text/keystrokes into a line -- the equivalent of
+    `screen -X stuff` for a telnet-backed console. '\\r' in the input is
+    treated as Enter. IAC bytes are escaped (doubled) since this goes out
+    over a raw telnet data stream."""
+    body = await request.json()
+    text = body.get("text", "")
+    line = body.get("line", "terminal")
+    if not isinstance(text, str) or not text:
+        return JSONResponse({"error": "'text' (string) is required"}, status_code=400)
+    d, err = _line_or_error(line)
+    if err:
+        return err
+    payload = text.replace("\\r", "\r").replace("\\n", "\r").encode("utf-8", errors="ignore")
+    payload = payload.replace(bytes([IAC]), bytes([IAC, IAC]))
+    d["writer"].write(payload)
+    await d["writer"].drain()
+    return {"ok": True}
+
+
+@app.get("/api/pidp10/status")
+def api_hr_status():
+    """Optional third route: lets the chat backend mention what's currently
+    running without the user having to say so. Adapt read_state()/is_running()
+    to however your own console app tracks that -- a state file, a process
+    check, whatever you already have."""
+    return {
+        "os": read_state().get("system"),
+        "running": is_running(),
+        "lines": {n: d["writer"] is not None for n, d in LINES.items()},
+    }
